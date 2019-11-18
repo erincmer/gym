@@ -1,149 +1,107 @@
-# -*- coding: utf-8 -*-
-"""
-@author: Olivier Sigaud
-
-A merge between two sources:
-
-* Adaptation of the MountainCar Environment from the "FAReinforcement" library
-of Jose Antonio Martin H. (version 1.0), adapted by  'Tom Schaul, tom@idsia.ch'
-and then modified by Arnaud de Broissia
-
-* the OpenAI/gym MountainCar environment
-itself from
-http://incompleteideas.net/sutton/MountainCar/MountainCar1.cp
-permalink: https://perma.cc/6Z2N-PFWC
-"""
-
-import math
-
-import numpy as np
-
 import gym
 from gym import spaces
 from gym.utils import seeding
+import numpy as np
+import math
+from blochsimu import Simulator
+import random
+from scipy.integrate import simps
+from itertools import product
 
 class Continuous_MountainCarEnv(gym.Env):
-    metadata = {
-        'render.modes': ['human', 'rgb_array'],
-        'video.frames_per_second': 30
-    }
 
-    def __init__(self, goal_velocity = 0):
-        self.min_action = -1.0
-        self.max_action = 1.0
-        self.min_position = -1.2
-        self.max_position = 0.6
-        self.max_speed = 0.07
-        self.goal_position = 0.45 # was 0.5 in gym, 0.45 in Arnaud de Broissia's version
-        self.goal_velocity = goal_velocity
-        self.power = 0.0015
+    def _B0_field(self,x, y, z):
+        return np.array([0, 0, 0.0001*( -1*((x-0.5*self.x_len)/self.x_len) + 0.6*((x-0.5*self.x_len)/self.x_len)*((x-0.5*self.x_len)/self.x_len) - 3*((x-0.5*self.x_len)/self.x_len)*((x-0.5*self.x_len)/self.x_len)*((x-0.5*self.x_len)/self.x_len))]) #10 ppm
 
-        self.low_state = np.array([self.min_position, -self.max_speed])
-        self.high_state = np.array([self.max_position, self.max_speed])
+    def _B1_field(self,x, y, z):
+        return np.array([0, 0, 1])
 
-        self.viewer = None
+    def _Gx_field(self,x, y, z):
+        return np.array([0, 0, ((x-0.5*self.x_len)/self.x_len)])
 
-        self.action_space = spaces.Box(low=self.min_action, high=self.max_action,
-                                       shape=(1,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=self.low_state, high=self.high_state,
-                                            dtype=np.float32)
+    def __init__(self,act_size = 3, size_x= 21,size_y = 1,size_z = 1, init_state=10., state_bound=1):
 
-        self.seed()
-        self.reset()
+        self.x_len, self.y_len, self.z_len = size_x, size_y, size_z
 
-    def seed(self, seed=None):
+        self.size = self.x_len * self.y_len * self.z_len * 3
+
+        self.init_state = np.zeros((self.size))
+
+        self.init_state[::3]=1
+
+        self.action_space = spaces.Box(low=-state_bound, high=state_bound, shape=(act_size,))
+
+        self.observation_space = spaces.Box(low=-state_bound, high=state_bound, shape=(self.size,))
+
+        self._seed()
+
+        self.done = False
+
+        self.pi = 3.1415
+
+        self.time_val = 1.65*pow(10, -3)              # Experiment length
+
+        self.maxB1=0.002
+
+        self.time_limit = 50
+
+        self.time_counter = 0
+
+        self.dt_val = self.time_val/self.time_limit              # Time between plays
+
+        self.numerical_steps= int(10*self.dt_val*(self.maxB1*42*1000000))               # Number of differential steps after a play
+
+        self.B0 = np.zeros([self.x_len, self.y_len, self.z_len, 3])
+
+        self.B1 = np.zeros([self.x_len, self.y_len, self.z_len,3])
+
+        self.grad_X = np.zeros([self.x_len, self.y_len, self.z_len,3])
+
+        for i,j,k in product(range(self.x_len), range(self.y_len), range(self.z_len)):
+            self.B0[i, j, k, :] = self._B0_field(i, j, k)
+            self.B1[i, j, k, :] = self._B1_field(i, j, k)
+            self.grad_X[i, j, k, :] = self._Gx_field(i, j, k)
+           
+
+    def _seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action):
 
-        position = self.state[0]
-        velocity = self.state[1]
-        force = min(max(action[0], -1.0), 1.0)
+    def _single_spin_stepper(self,single_state, field):
+        sim = Simulator(single_state, n_steps = self.numerical_steps)
+        for dt in range(self.numerical_steps):
+          single_state = sim.simulate_step(field, self.dt_val/self.numerical_steps)
+        single_state=np.array(single_state)/np.linalg.norm(single_state)
+        return single_state
 
-        velocity += force*self.power -0.0025 * math.cos(3*position)
-        if (velocity > self.max_speed): velocity = self.max_speed
-        if (velocity < -self.max_speed): velocity = -self.max_speed
-        position += velocity
-        if (position > self.max_position): position = self.max_position
-        if (position < self.min_position): position = self.min_position
-        if (position==self.min_position and velocity<0): velocity = 0
+    def _step(self,u):
 
-        done = bool(position >= self.goal_position and velocity >= self.goal_velocity)
+        reward = self._reward(u)
+        ind = 0
 
-        reward = 0
-        if done:
-            reward = 100.0
-        reward-= math.pow(action[0],2)*0.1
+        for i,j,k in product(range(self.x_len), range(self.y_len), range(self.z_len)):
+            point_field_1 = self.B0[i, j, k] + u[2]*self.grad_X[i, j, k]*self.maxB1/10
+            point_field_4 = [u[0]*math.sin(u[1]*self.pi)*self.maxB1,u[0]*math.cos(u[1]*self.pi)*self.maxB1,0]
+            point_field = point_field_1 + point_field_4
+            self.state[ind:ind+3] = self._single_spin_stepper(self.state[ind:ind+3] , point_field)
+            ind+=3
 
-        self.state = np.array([position, velocity])
-        return self.state, reward, done, {}
-
-    def reset(self):
-        self.state = np.array([self.np_random.uniform(low=-0.6, high=-0.4), 0])
-        return np.array(self.state)
-
-#    def get_state(self):
-#        return self.state
-
-    def _height(self, xs):
-        return np.sin(3 * xs)*.45+.55
-
-    def render(self, mode='human'):
-        screen_width = 600
-        screen_height = 400
-
-        world_width = self.max_position - self.min_position
-        scale = screen_width/world_width
-        carwidth=40
-        carheight=20
+        if self.time_counter == self.time_limit:
+            self.done = True
+            return self._reset(), reward, True, {}
+        self.time_counter +=1
+        return self._get_obs(), reward, self.done, {}
 
 
-        if self.viewer is None:
-            from gym.envs.classic_control import rendering
-            self.viewer = rendering.Viewer(screen_width, screen_height)
-            xs = np.linspace(self.min_position, self.max_position, 100)
-            ys = self._height(xs)
-            xys = list(zip((xs-self.min_position)*scale, ys*scale))
+    def _reward(self,u):
+          return np.abs(np.sum(self.state[::3])/(self.x_len*self.y_len*self.z_len))
 
-            self.track = rendering.make_polyline(xys)
-            self.track.set_linewidth(4)
-            self.viewer.add_geom(self.track)
+    def _reset(self):
+        self.state = self.init_state
+        self.done = False
+        self.time_counter = 0
+        return self._get_obs()
 
-            clearance = 10
-
-            l,r,t,b = -carwidth/2, carwidth/2, carheight, 0
-            car = rendering.FilledPolygon([(l,b), (l,t), (r,t), (r,b)])
-            car.add_attr(rendering.Transform(translation=(0, clearance)))
-            self.cartrans = rendering.Transform()
-            car.add_attr(self.cartrans)
-            self.viewer.add_geom(car)
-            frontwheel = rendering.make_circle(carheight/2.5)
-            frontwheel.set_color(.5, .5, .5)
-            frontwheel.add_attr(rendering.Transform(translation=(carwidth/4,clearance)))
-            frontwheel.add_attr(self.cartrans)
-            self.viewer.add_geom(frontwheel)
-            backwheel = rendering.make_circle(carheight/2.5)
-            backwheel.add_attr(rendering.Transform(translation=(-carwidth/4,clearance)))
-            backwheel.add_attr(self.cartrans)
-            backwheel.set_color(.5, .5, .5)
-            self.viewer.add_geom(backwheel)
-            flagx = (self.goal_position-self.min_position)*scale
-            flagy1 = self._height(self.goal_position)*scale
-            flagy2 = flagy1 + 50
-            flagpole = rendering.Line((flagx, flagy1), (flagx, flagy2))
-            self.viewer.add_geom(flagpole)
-            flag = rendering.FilledPolygon([(flagx, flagy2), (flagx, flagy2-10), (flagx+25, flagy2-5)])
-            flag.set_color(.8,.8,0)
-            self.viewer.add_geom(flag)
-
-        pos = self.state[0]
-        self.cartrans.set_translation((pos-self.min_position)*scale, self._height(pos)*scale)
-        self.cartrans.set_rotation(math.cos(3 * pos))
-
-        return self.viewer.render(return_rgb_array = mode=='rgb_array')
-
-    def close(self):
-        if self.viewer:
-            self.viewer.close()
-            self.viewer = None
+    def _get_obs(self):
+        return self.state
